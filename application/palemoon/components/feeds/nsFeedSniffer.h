@@ -18,7 +18,7 @@ public:
   NS_DECL_NSIREQUESTOBSERVER
   NS_DECL_NSISTREAMLISTENER
 
-  static NS_METHOD AppendSegmentToString(nsIInputStream* inputStream,
+  static nsresult AppendSegmentToString(nsIInputStream* inputStream,
                                          void* closure,
                                          const char* rawSegment,
                                          uint32_t toOffset,

@@ -47,6 +47,9 @@
 #include <mbstring.h>
 #include <shlwapi.h>
 
+#include <lm.h>
+#undef ACCESS_READ
+
 #ifndef MAX_BUF
 #define MAX_BUF 4096
 #endif
@@ -912,7 +915,7 @@ nsWindowsShellService::SetDesktopBackground(nsIDOMElement* aElement,
   // e.g. "Desktop Background.bmp"
   nsString fileLeafName;
   rv = shellBundle->GetStringFromName
-                      (MOZ_UTF16("desktopBackgroundLeafNameWin"),
+                      (u"desktopBackgroundLeafNameWin",
                        getter_Copies(fileLeafName));
   NS_ENSURE_SUCCESS(rv, rv);
 

@@ -6,7 +6,7 @@
 
 #include <urlhist.h>
 #include <shlguid.h>
-
+#include "prtime.h"
 #include "nsStringAPI.h"
 #include "nsNetUtil.h"
 #include "nsIVariant.h"
