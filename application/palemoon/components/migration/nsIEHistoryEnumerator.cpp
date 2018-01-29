@@ -6,12 +6,13 @@
 
 #include <urlhist.h>
 #include <shlguid.h>
-#include "prtime.h"
-#include "nsStringAPI.h"
-#include "nsNetUtil.h"
-#include "nsIVariant.h"
-#include "nsCOMArray.h"
 #include "nsArrayEnumerator.h"
+#include "nsCOMArray.h"
+#include "nsIURI.h"
+#include "nsIVariant.h"
+#include "nsNetUtil.h"
+#include "nsString.h"
+#include "prtime.h"
 
 namespace {
 

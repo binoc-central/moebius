@@ -25,12 +25,15 @@
 
 #ifdef XP_WIN
 #ifdef MOZ_ASAN
-// ASAN requires firefox.exe to be built with -MD, and it's OK if we don't
+// ASAN requires palemoon.exe to be built with -MD, and it's OK if we don't
 // support Windows XP SP2 in ASAN builds.
 #define XRE_DONT_SUPPORT_XPSP2
 #endif
 #define XRE_WANT_ENVIRON
 #define strcasecmp _stricmp
+#ifdef MOZ_SANDBOX
+#include "mozilla/sandboxing/SandboxInitialization.h"
+#endif
 #endif
 #include "BinaryPath.h"
 
@@ -90,6 +93,11 @@ SSE2Check()
 }
 #endif
 
+#if !defined(MOZ_WIDGET_COCOA) && !defined(MOZ_WIDGET_ANDROID)
+#define MOZ_BROWSER_CAN_BE_CONTENTPROC
+#include "../../ipc/contentproc/plugin-container.cpp"
+#endif
+
 using namespace mozilla;
 
 #ifdef XP_MACOSX
@@ -125,7 +133,7 @@ static void Output(const char *fmt, ... )
     decltype(MessageBoxW)* messageBoxW =
       (decltype(MessageBoxW)*) GetProcAddress(user32, "MessageBoxW");
     if (messageBoxW) {
-      messageBoxW(nullptr, wide_msg, L"Pale Moon", MB_OK
+      messageBoxW(nullptr, wide_msg, L"Palemoon", MB_OK
                                                 | MB_ICONERROR
                                                 | MB_SETFOREGROUND);
     }
@@ -161,7 +169,7 @@ Bootstrap::UniquePtr gBootstrap;
 
 static int do_main(int argc, char* argv[], char* envp[])
 {
-  // Allow firefox.exe to launch XULRunner apps via -app <application.ini>
+  // Allow palemoon.exe to launch XULRunner apps via -app <application.ini>
   // Note that -app must be the *first* argument.
   const char *appDataFile = getenv("XUL_APP_FILE");
   if ((!appDataFile || !*appDataFile) &&
@@ -187,6 +195,10 @@ static int do_main(int argc, char* argv[], char* envp[])
     }
 
     XREShellData shellData;
+#if defined(XP_WIN) && defined(MOZ_SANDBOX)
+    shellData.sandboxBrokerServices =
+      sandboxing::GetInitializedBrokerServices();
+#endif
 
     return gBootstrap->XRE_XPCShellMain(--argc, argv, envp, &shellData);
   }
@@ -201,6 +213,18 @@ static int do_main(int argc, char* argv[], char* envp[])
     config.appData = &sAppData;
     config.appDataPath = kDesktopFolder;
   }
+
+#if defined(XP_WIN) && defined(MOZ_SANDBOX)
+  sandbox::BrokerServices* brokerServices =
+    sandboxing::GetInitializedBrokerServices();
+#if defined(MOZ_CONTENT_SANDBOX)
+  if (!brokerServices) {
+    Output("Couldn't initialize the broker services.\n");
+    return 255;
+  }
+#endif
+  config.sandboxBrokerServices = brokerServices;
+#endif
 
 #ifdef LIBFUZZER
   if (getenv("LIBFUZZER"))
@@ -239,12 +263,44 @@ int main(int argc, char* argv[], char* envp[])
   DllBlocklist_Initialize();
 #endif
 
+#ifdef MOZ_BROWSER_CAN_BE_CONTENTPROC
+  // We are launching as a content process, delegate to the appropriate
+  // main
+  if (argc > 1 && IsArg(argv[1], "contentproc")) {
+#if defined(XP_WIN) && defined(MOZ_SANDBOX)
+    // We need to initialize the sandbox TargetServices before InitXPCOMGlue
+    // because we might need the sandbox broker to give access to some files.
+    if (IsSandboxedProcess() && !sandboxing::GetInitializedTargetServices()) {
+      Output("Failed to initialize the sandbox target services.");
+      return 255;
+    }
+#endif
+
+    nsresult rv = InitXPCOMGlue(argv[0]);
+    if (NS_FAILED(rv)) {
+      return 255;
+    }
+
+    int result = content_process_main(gBootstrap.get(), argc, argv);
+
+    // InitXPCOMGlue calls NS_LogInit, so we need to balance it here.
+    gBootstrap->NS_LogTerm();
+
+    return result;
+  }
+#endif
+
+
   nsresult rv = InitXPCOMGlue(argv[0]);
   if (NS_FAILED(rv)) {
     return 255;
   }
 
   gBootstrap->XRE_StartupTimelineRecord(mozilla::StartupTimeline::START, start);
+
+#ifdef MOZ_BROWSER_CAN_BE_CONTENTPROC
+  gBootstrap->XRE_EnableSameExecutableForContentProc();
+#endif
 
   int result = do_main(argc, argv, envp);
 

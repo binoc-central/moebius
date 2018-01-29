@@ -9,7 +9,10 @@
 #include "nsNetUtil.h"
 #include "nsIScriptSecurityManager.h"
 #include "mozilla/ArrayUtils.h"
-
+#include "nsIChannel.h"
+#include "nsIURI.h"
+#include "nsIProtocolHandler.h"
+#include "nsServiceManagerUtils.h"
 
 namespace mozilla {
 namespace browser {

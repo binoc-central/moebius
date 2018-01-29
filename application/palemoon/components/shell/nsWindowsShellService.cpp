@@ -3,6 +3,8 @@
  * License, v. 2.0. If a copy of the MPL was not distributed with this
  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
 
+#include "nsWindowsShellService.h"
+
 #include "imgIContainer.h"
 #include "imgIRequest.h"
 #include "mozilla/gfx/2D.h"
@@ -10,13 +12,14 @@
 #include "nsIDOMElement.h"
 #include "nsIDOMHTMLImageElement.h"
 #include "nsIImageLoadingContent.h"
+#include "nsIOutputStream.h"
 #include "nsIPrefService.h"
 #include "nsIPrefLocalizedString.h"
 #include "nsIServiceManager.h"
 #include "nsIStringBundle.h"
 #include "nsNetUtil.h"
+#include "nsServiceManagerUtils.h"
 #include "nsShellService.h"
-#include "nsWindowsShellService.h"
 #include "nsIProcess.h"
 #include "nsICategoryManager.h"
 #include "nsBrowserCompsCID.h"
@@ -27,6 +30,7 @@
 #include "nsUnicharUtils.h"
 #include "nsIWinTaskbar.h"
 #include "nsISupportsPrimitives.h"
+#include "nsIURLFormatter.h"
 #include "nsThreadUtils.h"
 #include "nsXULAppAPI.h"
 #include "mozilla/WindowsVersion.h"
@@ -98,18 +102,18 @@ OpenKeyForReading(HKEY aKeyRoot, const nsAString& aKeyName, HKEY* aKey)
 //    .htm .html .shtml .xht .xhtml 
 //   are mapped like so:
 //
-//   HKCU\SOFTWARE\Classes\.<ext>\      (default)         REG_SZ     PaleMoonHTML
+//   HKCU\SOFTWARE\Classes\.<ext>\      (default)         REG_SZ     BasiliskHTML
 //
 //   as aliases to the class:
 //
-//   HKCU\SOFTWARE\Classes\PaleMoonHTML\
+//   HKCU\SOFTWARE\Classes\BasiliskHTML\
 //     DefaultIcon                      (default)         REG_SZ     <apppath>,1
 //     shell\open\command               (default)         REG_SZ     <apppath> -osint -url "%1"
 //     shell\open\ddeexec               (default)         REG_SZ     <empty string>
 //
 // - Windows Vista and above Protocol Handler
 //
-//   HKCU\SOFTWARE\Classes\PaleMoonURL\  (default)         REG_SZ     <appname> URL
+//   HKCU\SOFTWARE\Classes\BasiliskURL\  (default)         REG_SZ     <appname> URL
 //                                      EditFlags         REG_DWORD  2
 //                                      FriendlyTypeName  REG_SZ     <appname> URL
 //     DefaultIcon                      (default)         REG_SZ     <apppath>,1
@@ -129,10 +133,10 @@ OpenKeyForReading(HKEY aKeyRoot, const nsAString& aKeyName, HKEY* aKey)
 //
 // - Windows Start Menu (XP SP1 and newer)
 //   -------------------------------------------------
-//   The following keys are set to make PaleMoon appear in the Start Menu as the
+//   The following keys are set to make Basilisk appear in the Start Menu as the
 //   browser:
 //   
-//   HKCU\SOFTWARE\Clients\StartMenuInternet\FIREFOX.EXE\
+//   HKCU\SOFTWARE\Clients\StartMenuInternet\BASILISK.EXE\
 //                                      (default)         REG_SZ     <appname>
 //     DefaultIcon                      (default)         REG_SZ     <apppath>,0
 //     InstallInfo                      HideIconsCommand  REG_SZ     <uninstpath> /HideShortcuts
@@ -153,7 +157,7 @@ typedef struct {
   const char* oldValueData;
 } SETTING;
 
-#define APP_REG_NAME L"Pale Moon"
+#define APP_REG_NAME L"Basilisk"
 #define VAL_FILE_ICON "%APPPATH%,1"
 #define VAL_OPEN "\"%APPPATH%\" -osint -url \"%1\""
 #define OLD_VAL_OPEN "\"%APPPATH%\" -requestPending -osint -url \"%1\""
@@ -167,11 +171,11 @@ typedef struct {
   PREFIX MID
 
 // The DefaultIcon registry key value should never be used when checking if
-// PaleMoon is the default browser for file handlers since other applications
+// Basilisk is the default browser for file handlers since other applications
 // (e.g. MS Office) may modify the DefaultIcon registry key value to add Icon
 // Handlers. see http://msdn2.microsoft.com/en-us/library/aa969357.aspx for
 // more info. The FTP protocol is not checked so advanced users can set the FTP
-// handler to another application and still have PaleMoon check if it is the
+// handler to another application and still have Basilisk check if it is the
 // default HTTP and HTTPS handler.
 // *** Do not add additional checks here unless you skip them when aForAllTypes
 // is false below***.
@@ -179,10 +183,10 @@ static SETTING gSettings[] = {
   // File Handler Class
   // ***keep this as the first entry because when aForAllTypes is not set below
   // it will skip over this check.***
-  { MAKE_KEY_NAME1("PaleMoonHTML", SOC), VAL_OPEN, OLD_VAL_OPEN },
+  { MAKE_KEY_NAME1("BasiliskHTML", SOC), VAL_OPEN, OLD_VAL_OPEN },
 
   // Protocol Handler Class - for Vista and above
-  { MAKE_KEY_NAME1("PaleMoonURL", SOC), VAL_OPEN, OLD_VAL_OPEN },
+  { MAKE_KEY_NAME1("BasiliskURL", SOC), VAL_OPEN, OLD_VAL_OPEN },
 
   // Protocol Handlers
   { MAKE_KEY_NAME1("HTTP", DI), VAL_FILE_ICON },
@@ -192,14 +196,14 @@ static SETTING gSettings[] = {
 };
 
 // The settings to disable DDE are separate from the default browser settings
-// since they are only checked when PaleMoon is the default browser and if they
+// since they are only checked when Basilisk is the default browser and if they
 // are incorrect they are fixed without notifying the user.
 static SETTING gDDESettings[] = {
   // File Handler Class
-  { MAKE_KEY_NAME1("Software\\Classes\\PaleMoonHTML", SOD) },
+  { MAKE_KEY_NAME1("Software\\Classes\\BasiliskHTML", SOD) },
 
   // Protocol Handler Class - for Vista and above
-  { MAKE_KEY_NAME1("Software\\Classes\\PaleMoonURL", SOD) },
+  { MAKE_KEY_NAME1("Software\\Classes\\BasiliskURL", SOD) },
 
   // Protocol Handlers
   { MAKE_KEY_NAME1("Software\\Classes\\FTP", SOD) },
@@ -281,20 +285,15 @@ nsWindowsShellService::ShortcutMaintenance()
     return NS_ERROR_UNEXPECTED;
 
   NS_NAMED_LITERAL_CSTRING(prefName, "browser.taskbar.lastgroupid");
-  nsCOMPtr<nsIPrefService> prefs =
+  nsCOMPtr<nsIPrefBranch> prefs =
     do_GetService(NS_PREFSERVICE_CONTRACTID);
   if (!prefs)
     return NS_ERROR_UNEXPECTED;
 
-  nsCOMPtr<nsIPrefBranch> prefBranch;
-  prefs->GetBranch(nullptr, getter_AddRefs(prefBranch));
-  if (!prefBranch)
-    return NS_ERROR_UNEXPECTED;
-
   nsCOMPtr<nsISupportsString> prefString;
-  rv = prefBranch->GetComplexValue(prefName.get(),
-                                   NS_GET_IID(nsISupportsString),
-                                   getter_AddRefs(prefString));
+  rv = prefs->GetComplexValue(prefName.get(),
+                              NS_GET_IID(nsISupportsString),
+                              getter_AddRefs(prefString));
   if (NS_SUCCEEDED(rv)) {
     nsAutoString version;
     prefString->GetData(version);
@@ -310,9 +309,9 @@ nsWindowsShellService::ShortcutMaintenance()
     return rv;
 
   prefString->SetData(appId);
-  rv = prefBranch->SetComplexValue(prefName.get(),
-                                   NS_GET_IID(nsISupportsString),
-                                   prefString);
+  rv = prefs->SetComplexValue(prefName.get(),
+                              NS_GET_IID(nsISupportsString),
+                              prefString);
   if (NS_FAILED(rv)) {
     NS_WARNING("Couldn't set last user model id!");
     return NS_ERROR_UNEXPECTED;
@@ -328,81 +327,80 @@ nsWindowsShellService::ShortcutMaintenance()
 }
 
 static bool
-IsAARDefaultHTTP(IApplicationAssociationRegistration* pAAR,
-                 bool* aIsDefaultBrowser)
+IsAARDefault(const RefPtr<IApplicationAssociationRegistration>& pAAR,
+             LPCWSTR aClassName)
 {
   // Make sure the Prog ID matches what we have
   LPWSTR registeredApp;
-  HRESULT hr = pAAR->QueryCurrentDefault(L"http", AT_URLPROTOCOL, AL_EFFECTIVE,
+  bool isProtocol = *aClassName != L'.';
+  ASSOCIATIONTYPE queryType = isProtocol ? AT_URLPROTOCOL : AT_FILEEXTENSION;
+  HRESULT hr = pAAR->QueryCurrentDefault(aClassName, queryType, AL_EFFECTIVE,
                                          &registeredApp);
-  if (SUCCEEDED(hr)) {
-    LPCWSTR firefoxHTTPProgID = L"PaleMoonURL";
-    *aIsDefaultBrowser = !wcsicmp(registeredApp, firefoxHTTPProgID);
-    CoTaskMemFree(registeredApp);
-  } else {
-    *aIsDefaultBrowser = false;
+  if (FAILED(hr)) {
+    return false;
   }
-  return SUCCEEDED(hr);
+
+  LPCWSTR progID = isProtocol ? L"BasiliskURL" : L"BasiliskHTML";
+  bool isDefault = !wcsicmp(registeredApp, progID);
+  CoTaskMemFree(registeredApp);
+
+  return isDefault;
 }
 
-static bool
-IsAARDefaultHTML(IApplicationAssociationRegistration* pAAR,
-                 bool* aIsDefaultBrowser)
+static void
+IsDefaultBrowserWin8(bool aCheckAllTypes, bool* aIsDefaultBrowser)
 {
-  LPWSTR registeredApp;
-  HRESULT hr = pAAR->QueryCurrentDefault(L".html", AT_FILEEXTENSION, AL_EFFECTIVE,
-                                         &registeredApp);
-  if (SUCCEEDED(hr)) {
-    LPCWSTR firefoxHTMLProgID = L"PaleMoonHTML";
-    *aIsDefaultBrowser = !wcsicmp(registeredApp, firefoxHTMLProgID);
-    CoTaskMemFree(registeredApp);
-  } else {
-    *aIsDefaultBrowser = false;
+  RefPtr<IApplicationAssociationRegistration> pAAR;
+  HRESULT hr = CoCreateInstance(CLSID_ApplicationAssociationRegistration,
+                                nullptr,
+                                CLSCTX_INPROC,
+                                IID_IApplicationAssociationRegistration,
+                                getter_AddRefs(pAAR));
+  if (FAILED(hr)) {
+    return;
   }
-  return SUCCEEDED(hr);
+
+  bool res = IsAARDefault(pAAR, L"http");
+  if (*aIsDefaultBrowser) {
+    *aIsDefaultBrowser = res;
+  }
+  res = IsAARDefault(pAAR, L".html");
+  if (*aIsDefaultBrowser && aCheckAllTypes) {
+    *aIsDefaultBrowser = res;
+  }
 }
 
 /*
  * Query's the AAR for the default status.
- * This only checks for PaleMoonURL and if aCheckAllTypes is set, then
- * it also checks for PaleMoonHTML.  Note that those ProgIDs are shared
- * by all PaleMoon browsers.
+ * This only checks for BasiliskURL and if aCheckAllTypes is set, then
+ * it also checks for BasiliskHTML.  Note that those ProgIDs are shared
+ * by all Basilisk browsers.
 */
 bool
 nsWindowsShellService::IsDefaultBrowserVista(bool aCheckAllTypes,
                                              bool* aIsDefaultBrowser)
 {
-  IApplicationAssociationRegistration* pAAR;
+  RefPtr<IApplicationAssociationRegistration> pAAR;
   HRESULT hr = CoCreateInstance(CLSID_ApplicationAssociationRegistration,
                                 nullptr,
                                 CLSCTX_INPROC,
                                 IID_IApplicationAssociationRegistration,
-                                (void**)&pAAR);
-
-  if (SUCCEEDED(hr)) {
-    if (aCheckAllTypes) {
-      BOOL res;
-      hr = pAAR->QueryAppIsDefaultAll(AL_EFFECTIVE,
-                                      APP_REG_NAME,
-                                      &res);
-      *aIsDefaultBrowser = res;
-
-      // If we have all defaults, let's make sure that our ProgID
-      // is explicitly returned as well. Needed only for Windows 8.
-      if (*aIsDefaultBrowser && IsWin8OrLater()) {
-        IsAARDefaultHTTP(pAAR, aIsDefaultBrowser);
-        if (*aIsDefaultBrowser) {
-          IsAARDefaultHTML(pAAR, aIsDefaultBrowser);
-        }
-      }
-    } else {
-      IsAARDefaultHTTP(pAAR, aIsDefaultBrowser);
-    }
-
-    pAAR->Release();
-    return true;
+                                getter_AddRefs(pAAR));
+  if (FAILED(hr)) {
+    return false;
   }
-  return false;
+
+  if (aCheckAllTypes) {
+    BOOL res;
+    hr = pAAR->QueryAppIsDefaultAll(AL_EFFECTIVE,
+                                    APP_REG_NAME,
+                                    &res);
+    *aIsDefaultBrowser = res;
+  } else if (!IsWin8OrLater()) {
+    *aIsDefaultBrowser = IsAARDefault(pAAR, L"http");
+  }
+
+  return true;
 }
 
 NS_IMETHODIMP
@@ -410,12 +408,6 @@ nsWindowsShellService::IsDefaultBrowser(bool aStartupCheck,
                                         bool aForAllTypes,
                                         bool* aIsDefaultBrowser)
 {
-  // If this is the first browser window, maintain internal state that we've
-  // checked this session (so that subsequent window opens don't show the
-  // default browser dialog).
-  if (aStartupCheck)
-    mCheckedThisSession = true;
-
   // Assume we're the default unless one of the several checks below tell us
   // otherwise.
   *aIsDefaultBrowser = true;
@@ -425,7 +417,7 @@ nsWindowsShellService::IsDefaultBrowser(bool aStartupCheck,
     return NS_ERROR_FAILURE;
 
   // Convert the path to a long path since GetModuleFileNameW returns the path
-  // that was used to launch PaleMoon which is not necessarily a long path.
+  // that was used to launch Basilisk which is not necessarily a long path.
   if (!::GetLongPathNameW(exePath, exePath, MAX_BUF))
     return NS_ERROR_FAILURE;
 
@@ -474,40 +466,42 @@ nsWindowsShellService::IsDefaultBrowser(bool aStartupCheck,
         return NS_OK;
       }
 
-      res = ::RegOpenKeyExW(HKEY_CLASSES_ROOT, PromiseFlatString(keyName).get(),
+      res = ::RegOpenKeyExW(HKEY_CLASSES_ROOT, keyName.get(),
                             0, KEY_SET_VALUE, &theKey);
       if (REG_FAILED(res)) {
         // If updating the open command fails try to update it using the helper
-        // application when setting PaleMoon as the default browser.
+        // application when setting Basilisk as the default browser.
         *aIsDefaultBrowser = false;
         return NS_OK;
       }
 
-      const nsString &flatValue = PromiseFlatString(valueData);
       res = ::RegSetValueExW(theKey, L"", 0, REG_SZ,
-                             (const BYTE *) flatValue.get(),
-                             (flatValue.Length() + 1) * sizeof(char16_t));
+                             (const BYTE *) valueData.get(),
+                             (valueData.Length() + 1) * sizeof(char16_t));
       // Close the key that was created.
       ::RegCloseKey(theKey);
       if (REG_FAILED(res)) {
         // If updating the open command fails try to update it using the helper
-        // application when setting PaleMoon as the default browser.
+        // application when setting Basilisk as the default browser.
         *aIsDefaultBrowser = false;
         return NS_OK;
       }
     }
   }
 
-  // Only check if PaleMoon is the default browser on Vista and above if the
-  // previous checks show that PaleMoon is the default browser.
+  // Only check if Basilisk is the default browser on Vista and above if the
+  // previous checks show that Basilisk is the default browser.
   if (*aIsDefaultBrowser) {
     IsDefaultBrowserVista(aForAllTypes, aIsDefaultBrowser);
+    if (IsWin8OrLater()) {
+      IsDefaultBrowserWin8(aForAllTypes, aIsDefaultBrowser);
+    }
   }
 
   // To handle the case where DDE isn't disabled due for a user because there
-  // account didn't perform a PaleMoon update this will check if PaleMoon is the
+  // account didn't perform a Basilisk update this will check if Basilisk is the
   // default browser and if dde is disabled for each handler
-  // and if it isn't disable it. When PaleMoon is not the default browser the
+  // and if it isn't disable it. When Basilisk is not the default browser the
   // helper application will disable dde for each handler.
   if (*aIsDefaultBrowser && aForAllTypes) {
     // Check ftp settings
@@ -521,7 +515,7 @@ nsWindowsShellService::IsDefaultBrowser(bool aStartupCheck,
       if (NS_FAILED(rv)) {
         ::RegCloseKey(theKey);
         // If disabling DDE fails try to disable it using the helper
-        // application when setting PaleMoon as the default browser.
+        // application when setting Basilisk as the default browser.
         *aIsDefaultBrowser = false;
         return NS_OK;
       }
@@ -535,14 +529,13 @@ nsWindowsShellService::IsDefaultBrowser(bool aStartupCheck,
       if (REG_FAILED(res) || char16_t('\0') != *currValue) {
         // Key wasn't set or was set to something other than our registry entry.
         // Delete the key along with all of its childrean and then recreate it.
-        const nsString &flatName = PromiseFlatString(keyName);
-        ::SHDeleteKeyW(HKEY_CURRENT_USER, flatName.get());
-        res = ::RegCreateKeyExW(HKEY_CURRENT_USER, flatName.get(), 0, nullptr,
+        ::SHDeleteKeyW(HKEY_CURRENT_USER, keyName.get());
+        res = ::RegCreateKeyExW(HKEY_CURRENT_USER, keyName.get(), 0, nullptr,
                                 REG_OPTION_NON_VOLATILE, KEY_SET_VALUE,
                                 nullptr, &theKey, nullptr);
         if (REG_FAILED(res)) {
           // If disabling DDE fails try to disable it using the helper
-          // application when setting PaleMoon as the default browser.
+          // application when setting Basilisk as the default browser.
           *aIsDefaultBrowser = false;
           return NS_OK;
         }
@@ -553,7 +546,7 @@ nsWindowsShellService::IsDefaultBrowser(bool aStartupCheck,
         ::RegCloseKey(theKey);
         if (REG_FAILED(res)) {
           // If disabling DDE fails try to disable it using the helper
-          // application when setting PaleMoon as the default browser.
+          // application when setting Basilisk as the default browser.
           *aIsDefaultBrowser = false;
           return NS_OK;
         }
@@ -589,27 +582,19 @@ nsWindowsShellService::IsDefaultBrowser(bool aStartupCheck,
 
     NS_ConvertUTF8toUTF16 valueData(VAL_OPEN);
     valueData.Replace(offset, 9, appLongPath);
-    const nsString &flatValue = PromiseFlatString(valueData);
     res = ::RegSetValueExW(theKey, L"", 0, REG_SZ,
-                           (const BYTE *) flatValue.get(),
-                           (flatValue.Length() + 1) * sizeof(char16_t));
+                           (const BYTE *) valueData.get(),
+                           (valueData.Length() + 1) * sizeof(char16_t));
     // Close the key that was created.
     ::RegCloseKey(theKey);
     // If updating the FTP protocol handlers shell open command fails try to
-    // update it using the helper application when setting PaleMoon as the
+    // update it using the helper application when setting Basilisk as the
     // default browser.
     if (REG_FAILED(res)) {
       *aIsDefaultBrowser = false;
     }
   }
 
-  return NS_OK;
-}
-
-NS_IMETHODIMP
-nsWindowsShellService::GetCanSetDesktopBackground(bool* aResult)
-{
-  *aResult = true;
   return NS_OK;
 }
 
@@ -631,16 +616,41 @@ DynSHOpenWithDialog(HWND hwndParent, const OPENASINFO *poainfo)
     return NS_ERROR_FAILURE;
   }
 
-  nsresult rv = 
-    SUCCEEDED(SHOpenWithDialogFn(hwndParent, poainfo)) ? NS_OK :
-                                                         NS_ERROR_FAILURE;
+  nsresult rv;
+  HRESULT hr = SHOpenWithDialogFn(hwndParent, poainfo);
+  if (SUCCEEDED(hr) || (hr == HRESULT_FROM_WIN32(ERROR_CANCELLED))) {
+    rv = NS_OK;
+  } else {
+    rv = NS_ERROR_FAILURE;
+  }
   FreeLibrary(shellDLL);
   return rv;
 }
 
 nsresult
+nsWindowsShellService::LaunchControlPanelDefaultsSelectionUI()
+{
+  IApplicationAssociationRegistrationUI* pAARUI;
+  HRESULT hr = CoCreateInstance(CLSID_ApplicationAssociationRegistrationUI,
+                                NULL,
+                                CLSCTX_INPROC,
+                                IID_IApplicationAssociationRegistrationUI,
+                                (void**)&pAARUI);
+  if (SUCCEEDED(hr)) {
+    hr = pAARUI->LaunchAdvancedAssociationUI(APP_REG_NAME);
+    pAARUI->Release();
+  }
+  return SUCCEEDED(hr) ? NS_OK : NS_ERROR_FAILURE;
+}
+
+nsresult
 nsWindowsShellService::LaunchControlPanelDefaultPrograms()
 {
+  // This Default Programs feature is Win7+ only.
+  if (!IsWin7OrLater()) {
+    return NS_ERROR_FAILURE;
+  }
+
   // Build the path control.exe path safely
   WCHAR controlEXEPath[MAX_PATH + 1] = { '\0' };
   if (!GetSystemDirectoryW(controlEXEPath, MAX_PATH)) {
@@ -654,7 +664,8 @@ nsWindowsShellService::LaunchControlPanelDefaultPrograms()
     return NS_ERROR_FAILURE;
   }
 
-  WCHAR params[] = L"control.exe /name Microsoft.DefaultPrograms /page pageDefaultProgram";
+  WCHAR params[] = L"control.exe /name Microsoft.DefaultPrograms /page "
+    "pageDefaultProgram\\pageAdvancedSettings?pszAppName=" APP_REG_NAME;
   STARTUPINFOW si = {sizeof(si), 0};
   si.dwFlags = STARTF_USESHOWWINDOW;
   si.wShowWindow = SW_SHOWDEFAULT;
@@ -669,9 +680,62 @@ nsWindowsShellService::LaunchControlPanelDefaultPrograms()
   return NS_OK;
 }
 
+static bool
+IsWindowsLogonConnected()
+{
+  WCHAR userName[UNLEN + 1];
+  DWORD size = ArrayLength(userName);
+  if (!GetUserNameW(userName, &size)) {
+    return false;
+  }
+
+  LPUSER_INFO_24 info;
+  if (NetUserGetInfo(nullptr, userName, 24, (LPBYTE *)&info)
+      != NERR_Success) {
+    return false;
+  }
+  bool connected = info->usri24_internet_identity;
+  NetApiBufferFree(info);
+
+  return connected;
+}
+
+static bool
+SettingsAppBelievesConnected()
+{
+  nsresult rv;
+  nsCOMPtr<nsIWindowsRegKey> regKey =
+    do_CreateInstance("@mozilla.org/windows-registry-key;1", &rv);
+  if (NS_FAILED(rv)) {
+    return false;
+  }
+
+  rv = regKey->Open(nsIWindowsRegKey::ROOT_KEY_CURRENT_USER,
+                    NS_LITERAL_STRING("SOFTWARE\\Microsoft\\Windows\\Shell\\Associations"),
+                    nsIWindowsRegKey::ACCESS_READ);
+  if (NS_FAILED(rv)) {
+    return false;
+  }
+
+  uint32_t value;
+  rv = regKey->ReadIntValue(NS_LITERAL_STRING("IsConnectedAtLogon"), &value);
+  if (NS_FAILED(rv)) {
+    return false;
+  }
+
+  return !!value;
+}
+
 nsresult
 nsWindowsShellService::LaunchModernSettingsDialogDefaultApps()
 {
+  if (!IsWindowsBuildOrLater(14965) &&
+      !IsWindowsLogonConnected() && SettingsAppBelievesConnected()) {
+    // Use the classic Control Panel to work around a bug of older
+    // builds of Windows 10.
+    return LaunchControlPanelDefaultPrograms();
+  }
+
   IApplicationActivationManager* pActivator;
   HRESULT hr = CoCreateInstance(CLSID_ApplicationActivationManager,
                                 nullptr,
@@ -685,8 +749,47 @@ nsWindowsShellService::LaunchModernSettingsDialogDefaultApps()
            L"windows.immersivecontrolpanel_cw5n1h2txyewy"
            L"!microsoft.windows.immersivecontrolpanel",
            L"page=SettingsPageAppsDefaults", AO_NONE, &pid);
+    if (SUCCEEDED(hr)) {
+      // Do not check error because we could at least open
+      // the "Default apps" setting.
+      pActivator->ActivateApplication(
+             L"windows.immersivecontrolpanel_cw5n1h2txyewy"
+             L"!microsoft.windows.immersivecontrolpanel",
+             L"page=SettingsPageAppsDefaults"
+             L"&target=SystemSettings_DefaultApps_Browser", AO_NONE, &pid);
+    }
     pActivator->Release();
     return SUCCEEDED(hr) ? NS_OK : NS_ERROR_FAILURE;
+  }
+  return NS_OK;
+}
+
+nsresult
+nsWindowsShellService::InvokeHTTPOpenAsVerb()
+{
+  nsCOMPtr<nsIURLFormatter> formatter(
+    do_GetService("@mozilla.org/toolkit/URLFormatterService;1"));
+  if (!formatter) {
+    return NS_ERROR_UNEXPECTED;
+  }
+
+  nsString urlStr;
+  nsresult rv = formatter->FormatURLPref(
+    NS_LITERAL_STRING("app.support.baseURL"), urlStr);
+  if (NS_FAILED(rv)) {
+    return rv;
+  }
+  if (!StringBeginsWith(urlStr, NS_LITERAL_STRING("https://"))) {
+    return NS_ERROR_FAILURE;
+  }
+  urlStr.AppendLiteral("win10-default-browser");
+
+  SHELLEXECUTEINFOW seinfo = { sizeof(SHELLEXECUTEINFOW) };
+  seinfo.lpVerb = L"openas";
+  seinfo.lpFile = urlStr.get();
+  seinfo.nShow = SW_SHOWNORMAL;
+  if (!ShellExecuteExW(&seinfo)) {
+    return NS_ERROR_FAILURE;
   }
   return NS_OK;
 }
@@ -719,16 +822,23 @@ nsWindowsShellService::SetDefaultBrowser(bool aClaimAllTypes, bool aForAllUsers)
   nsresult rv = LaunchHelper(appHelperPath);
   if (NS_SUCCEEDED(rv) && IsWin8OrLater()) {
     if (aClaimAllTypes) {
-      rv = LaunchControlPanelDefaultPrograms();
+      if (IsWin10OrLater()) {
+        rv = LaunchModernSettingsDialogDefaultApps();
+      } else {
+        rv = LaunchControlPanelDefaultsSelectionUI();
+      }
       // The above call should never really fail, but just in case
       // fall back to showing the HTTP association screen only.
       if (NS_FAILED(rv)) {
-        rv = LaunchHTTPHandlerPane();
+        if (IsWin10OrLater()) {
+          rv = InvokeHTTPOpenAsVerb();
+        } else {
+          rv = LaunchHTTPHandlerPane();
+        }
       }
     } else {
-      // Windows 10 blocks attempts to load the HTTP Handler
-      // association dialog, so the modern Settings dialog
-      // is opened with the Default Apps view loaded.
+      // Windows 10 blocks attempts to load the
+      // HTTP Handler association dialog.
       if (IsWin10OrLater()) {
         rv = LaunchModernSettingsDialogDefaultApps();
       } else {
@@ -738,50 +848,20 @@ nsWindowsShellService::SetDefaultBrowser(bool aClaimAllTypes, bool aForAllUsers)
       // The above call should never really fail, but just in case
       // fall back to showing control panel for all defaults
       if (NS_FAILED(rv)) {
-        rv = LaunchControlPanelDefaultPrograms();
+        rv = LaunchControlPanelDefaultsSelectionUI();
       }
     }
   }
 
-  return rv;
-}
-
-NS_IMETHODIMP
-nsWindowsShellService::GetShouldCheckDefaultBrowser(bool* aResult)
-{
-  NS_ENSURE_ARG_POINTER(aResult);
-
-  // If we've already checked, the browser has been started and this is a 
-  // new window open, and we don't want to check again.
-  if (mCheckedThisSession) {
-    *aResult = false;
-    return NS_OK;
+  nsCOMPtr<nsIPrefBranch> prefs(do_GetService(NS_PREFSERVICE_CONTRACTID));
+  if (prefs) {
+    (void) prefs->SetBoolPref(PREF_CHECKDEFAULTBROWSER, true);
+    // Reset the number of times the dialog should be shown
+    // before it is silenced.
+    (void) prefs->SetIntPref(PREF_DEFAULTBROWSERCHECKCOUNT, 0);
   }
 
-  nsCOMPtr<nsIPrefBranch> prefs;
-  nsresult rv;
-  nsCOMPtr<nsIPrefService> pserve(do_GetService(NS_PREFSERVICE_CONTRACTID, &rv));
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  rv = pserve->GetBranch("", getter_AddRefs(prefs));
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  return prefs->GetBoolPref(PREF_CHECKDEFAULTBROWSER, aResult);
-}
-
-NS_IMETHODIMP
-nsWindowsShellService::SetShouldCheckDefaultBrowser(bool aShouldCheck)
-{
-  nsCOMPtr<nsIPrefBranch> prefs;
-  nsresult rv;
-
-  nsCOMPtr<nsIPrefService> pserve(do_GetService(NS_PREFSERVICE_CONTRACTID, &rv));
-  NS_ENSURE_SUCCESS(rv, rv);
-  
-  rv = pserve->GetBranch("", getter_AddRefs(prefs));
-  NS_ENSURE_SUCCESS(rv, rv);
-
-  return prefs->SetBoolPref(PREF_CHECKDEFAULTBROWSER, aShouldCheck);
+  return rv;
 }
 
 static nsresult
@@ -925,7 +1005,7 @@ nsWindowsShellService::SetDesktopBackground(nsIDOMElement* aElement,
                               getter_AddRefs(file));
   NS_ENSURE_SUCCESS(rv, rv);
 
-  // eventually, the path is "%APPDATA%\Mozilla\PaleMoon\Desktop Background.bmp"
+  // eventually, the path is "%APPDATA%\Mozilla\Basilisk\Desktop Background.bmp"
   rv = file->Append(fileLeafName);
   NS_ENSURE_SUCCESS(rv, rv);
 
@@ -951,24 +1031,24 @@ nsWindowsShellService::SetDesktopBackground(nsIDOMElement* aElement,
     nsAutoString style;
     switch (aPosition) {
       case BACKGROUND_TILE:
-        style.AssignLiteral("0");
-        tile.AssignLiteral("1");
+        style.Assign('0');
+        tile.Assign('1');
         break;
       case BACKGROUND_CENTER:
-        style.AssignLiteral("0");
-        tile.AssignLiteral("0");
+        style.Assign('0');
+        tile.Assign('0');
         break;
       case BACKGROUND_STRETCH:
-        style.AssignLiteral("2");
-        tile.AssignLiteral("0");
+        style.Assign('2');
+        tile.Assign('0');
         break;
       case BACKGROUND_FILL:
         style.AssignLiteral("10");
-        tile.AssignLiteral("0");
+        tile.Assign('0');
         break;
       case BACKGROUND_FIT:
-        style.AssignLiteral("6");
-        tile.AssignLiteral("0");
+        style.Assign('6');
+        tile.Assign('0');
         break;
     }
 
@@ -1026,7 +1106,7 @@ nsWindowsShellService::OpenApplication(int32_t aApplication)
   ::RegCloseKey(theKey);
 
   // Find the "open" command
-  application.AppendLiteral("\\");
+  application.Append('\\');
   application.Append(buf);
   application.AppendLiteral("\\shell\\open\\command");
 
@@ -1125,8 +1205,7 @@ nsWindowsShellService::SetDesktopBackgroundColor(uint32_t aColor)
   return regKey->Close();
 }
 
-nsWindowsShellService::nsWindowsShellService() : 
-  mCheckedThisSession(false) 
+nsWindowsShellService::nsWindowsShellService()
 {
 }
 

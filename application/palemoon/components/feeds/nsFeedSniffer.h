@@ -6,11 +6,11 @@
 
 #include "nsIContentSniffer.h"
 #include "nsIStreamListener.h"
-#include "nsStringAPI.h"
+#include "nsString.h"
 #include "mozilla/Attributes.h"
 
 class nsFeedSniffer final : public nsIContentSniffer,
-                                       nsIStreamListener
+                                   nsIStreamListener
 {
 public:
   NS_DECL_ISUPPORTS
@@ -19,11 +19,11 @@ public:
   NS_DECL_NSISTREAMLISTENER
 
   static nsresult AppendSegmentToString(nsIInputStream* inputStream,
-                                         void* closure,
-                                         const char* rawSegment,
-                                         uint32_t toOffset,
-                                         uint32_t count,
-                                         uint32_t* writeCount);
+                                        void* closure,
+                                        const char* rawSegment,
+                                        uint32_t toOffset,
+                                        uint32_t count,
+                                        uint32_t* writeCount);
 
 protected:
   ~nsFeedSniffer() {}
